@@ -1,0 +1,13 @@
+services:
+  chunker-api:
+    build: .
+    container_name: chunker-book-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/jobs:/data/jobs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

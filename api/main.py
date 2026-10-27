@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/data/jobs")).resolve()
 CHUNKER_SCRIPT = Path(
     os.getenv("CHUNKER_SCRIPT", "/app/src/persian_ocr_chunker_full_llm_v14.py")
@@ -56,7 +56,7 @@ app = FastAPI(
     title="Persian Book Chunker API",
     version=APP_VERSION,
     description=(
-        "PDF → OCR → Full-LLM BookPlan/Atomizer/Planner → chunks.jsonl. "
+        "PDF or pre-OCR JSON → Full-LLM BookPlan/Atomizer/Planner → chunks.jsonl. "
         "Designed as a job API so a UI can show readable progress and errors."
     ),
 )
@@ -94,6 +94,7 @@ def paths_for(job_id: str) -> Dict[str, Path]:
     return {
         "root": root,
         "source": root / "source" / "book.pdf",
+        "ocr_input": root / "source" / "ocr.json",
         "ocr_raw": root / "ocr" / "ocr_raw.json",
         "ocr_book": root / "ocr" / "book",
         "ocr_normalized": root / "ocr" / "book" / "ocr.json",
@@ -112,7 +113,7 @@ def atomic_write_json(path: Path, obj: Dict[str, Any]) -> None:
 
 
 def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def read_status(job_id: str) -> Dict[str, Any]:
@@ -230,6 +231,9 @@ def normalize_ocr_for_chunker(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     if not normalized_pages:
         raise ValueError("OCR response contains no usable pages")
+    if not any(str(block.get("text") or "").strip()
+               for page in normalized_pages for block in page["blocks"]):
+        raise ValueError("OCR pages contain no text blocks; expected pages[].cells or pages[].blocks")
     return {"pages": normalized_pages}
 
 
@@ -418,12 +422,20 @@ def run_job(job_id: str) -> None:
     try:
         write_status(job_id, status="processing", started_at=utc_now(), error=None)
 
-        set_stage(job_id, "ocr", 5, "Sending PDF to OCR service")
-        raw = call_ocr(job_id, p["source"])
+        input_type = read_status(job_id).get("input_type", "pdf")
+        if input_type == "ocr_json":
+            # Never contact the OCR service for a supplied OCR result.
+            raw = read_json(p["ocr_input"])
+            set_stage(job_id, "ocr_skipped", 30, "OCR skipped: supplied OCR JSON")
+            emit_event(job_id, level="info", stage="ocr_skipped", progress=30,
+                       message="OCR API was not called; using supplied OCR JSON")
+        else:
+            set_stage(job_id, "ocr", 5, "Sending PDF to OCR service")
+            raw = call_ocr(job_id, p["source"])
+            pages = raw.get("pages") if isinstance(raw.get("pages"), list) else []
+            set_stage(job_id, "ocr", 30, f"OCR completed ({len(pages)} pages)")
         p["ocr_raw"].parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(p["ocr_raw"], raw)
-        pages = raw.get("pages") if isinstance(raw.get("pages"), list) else []
-        set_stage(job_id, "ocr", 30, f"OCR completed ({len(pages)} pages)")
 
         set_stage(job_id, "normalizing", 34, "Preparing OCR output for semantic chunking")
         normalized = normalize_ocr_for_chunker(raw)
@@ -446,6 +458,8 @@ def run_job(job_id: str) -> None:
             message=f"Completed successfully ({chunk_count} chunks)",
             completed_at=utc_now(),
             result={
+                "input_type": input_type,
+                "ocr_skipped": input_type == "ocr_json",
                 "chunk_count": chunk_count,
                 "chunks_path": relative_chunks,
                 "chunks_json_url": f"/v1/jobs/{job_id}/chunks",
@@ -507,7 +521,7 @@ def startup_reconcile() -> None:
                     jid,
                     str(status.get("stage") or "server"),
                     "SERVER_RESTARTED",
-                    "The API restarted while this job was running. Submit the PDF again.",
+                    "The API restarted while this job was running. Submit the input again.",
                 )
         except Exception:
             continue
@@ -523,7 +537,9 @@ def health() -> Dict[str, Any]:
 
 
 @app.get("/ready")
-def ready() -> Dict[str, Any]:
+def ready(input_type: str = "pdf") -> Dict[str, Any]:
+    if input_type not in {"pdf", "ocr_json"}:
+        raise HTTPException(status_code=400, detail="input_type must be pdf or ocr_json")
     llm_configured = bool(CHUNKER_LLM_URLS or CHUNKER_LLM_URL or (CHUNKER_LLM_HOST and CHUNKER_LLM_PORTS))
     checks = {
         "chunker_script": CHUNKER_SCRIPT.exists(),
@@ -531,53 +547,79 @@ def ready() -> Dict[str, Any]:
         "llm_endpoint": llm_configured,
         "data_root": DATA_ROOT.exists(),
     }
-    if not all(checks.values()):
-        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})
-    return {"status": "ready", "checks": checks}
+    # OCR API credentials are not required to process an already-OCRed book.
+    required = {name: ok for name, ok in checks.items()
+                if name != "ocr_api_key" or input_type == "pdf"}
+    if not all(required.values()):
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "input_type": input_type, "checks": checks})
+    return {"status": "ready", "input_type": input_type, "checks": checks}
 
 
 @app.post("/v1/jobs", response_model=JobAccepted, status_code=202)
-async def create_job(request: Request, pdf_file: UploadFile = File(...)) -> JobAccepted:
-    name = (pdf_file.filename or "book.pdf").lower()
-    if not name.endswith(".pdf"):
-        raise HTTPException(status_code=415, detail="Only PDF files are accepted")
+async def create_job(
+    request: Request,
+    pdf_file: Optional[UploadFile] = File(None),
+    ocr_file: Optional[UploadFile] = File(None),
+    input_file: Optional[UploadFile] = File(None),
+) -> JobAccepted:
+    """Keep legacy pdf_file clients working; OCR JSON can use ocr_file or input_file."""
+    supplied = [f for f in (pdf_file, ocr_file, input_file) if f is not None]
+    if len(supplied) != 1:
+        raise HTTPException(status_code=422, detail="Supply exactly one of pdf_file, ocr_file, input_file")
+    upload = supplied[0]
+    name = upload.filename or ""
+    extension = Path(name).suffix.lower()
+    if extension not in {".pdf", ".json"}:
+        raise HTTPException(status_code=415, detail="Only PDF or OCR JSON (.json) is accepted")
+    if ocr_file is not None and extension != ".json":
+        raise HTTPException(status_code=415, detail="ocr_file must be .json")
+    input_type = "ocr_json" if extension == ".json" else "pdf"
 
     jid = str(uuid.uuid4())
     p = paths_for(jid)
-    p["source"].parent.mkdir(parents=True, exist_ok=True)
-
+    dest = p["ocr_input"] if input_type == "ocr_json" else p["source"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
     size = 0
     try:
-        with p["source"].open("wb") as out:
+        with dest.open("wb") as out:
             while True:
-                chunk = await pdf_file.read(1024 * 1024)
+                chunk = await upload.read(1024 * 1024)
                 if not chunk:
                     break
                 size += len(chunk)
                 if size > max_bytes:
-                    raise HTTPException(status_code=413, detail=f"PDF exceeds {MAX_UPLOAD_MB} MB limit")
+                    raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_MB} MB limit")
                 out.write(chunk)
+        if input_type == "pdf":
+            with dest.open("rb") as f:
+                if f.read(5) != b"%PDF-":
+                    raise HTTPException(status_code=400, detail="Uploaded file does not have a valid PDF signature")
+        else:
+            try:
+                obj = read_json(dest)
+                if not isinstance(obj, dict):
+                    raise ValueError("OCR JSON must be a JSON object")
+                normalize_ocr_for_chunker(obj)
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid OCR JSON: {exc}") from exc
     except Exception:
         shutil.rmtree(p["root"], ignore_errors=True)
         raise
     finally:
-        await pdf_file.close()
-
-    with p["source"].open("rb") as f:
-        if f.read(5) != b"%PDF-":
-            shutil.rmtree(p["root"], ignore_errors=True)
-            raise HTTPException(status_code=400, detail="Uploaded file does not have a valid PDF signature")
+        await upload.close()
 
     base = str(request.base_url).rstrip("/")
     initial = {
         "job_id": jid,
-        "filename": pdf_file.filename or "book.pdf",
+        "filename": name,
         "size_bytes": size,
+        "input_type": input_type,
+        "ocr_skipped": input_type == "ocr_json",
         "status": "queued",
         "stage": "queued",
         "progress": 0,
-        "message": "PDF uploaded; waiting for processing",
+        "message": "OCR JSON uploaded; OCR will be skipped" if input_type == "ocr_json" else "PDF uploaded; waiting for processing",
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "error": None,
@@ -586,7 +628,6 @@ async def create_job(request: Request, pdf_file: UploadFile = File(...)) -> JobA
     atomic_write_json(p["status"], initial)
     emit_event(jid, level="info", stage="queued", progress=0, message=initial["message"])
     EXECUTOR.submit(run_job, jid)
-
     return JobAccepted(
         job_id=jid,
         status="queued",
